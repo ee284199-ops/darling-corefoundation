@@ -179,7 +179,25 @@ static Boolean CFURLStat(CFURLRef url, struct stat *info) {
     return false;
 }
 
+// like CFURLStat, but about a symbolic link itself rather than what it points to
+static Boolean CFURLLstat(CFURLRef url, struct stat *info) {
+    UInt8 path[PATH_MAX] = { 0 };
+
+    if (CFURLGetFileSystemRepresentation(url, true, path, PATH_MAX))
+    {
+        return lstat(path, info) != -1;
+    }
+
+    return false;
+}
+
 static pthread_mutex_t resInfoLock = PTHREAD_MUTEX_INITIALIZER;
+
+// CFDate takes absolute time (seconds since 2001), while stat times count from 1970
+static CFDateRef dateFromTimespec(struct timespec time)
+{
+    return CFDateCreate(kCFAllocatorDefault, (CFAbsoluteTime) time.tv_sec + time.tv_nsec / 1.0e9 - kCFAbsoluteTimeIntervalSince1970);
+}
 
 static CFTypeRef CFURLCreatePropertyForKey(CFURLRef url, CFStringRef key, CFErrorRef *error)
 {
@@ -189,16 +207,13 @@ static CFTypeRef CFURLCreatePropertyForKey(CFURLRef url, CFStringRef key, CFErro
     if (CFEqual(key, kCFURLNameKey))
     {
         //Key for the resource’s name in the file system, returned as a CFString object.
-        CFURLRef trimmed = CFURLCreateCopyDeletingPathExtension(kCFAllocatorDefault, url);
-        value = CFURLCopyLastPathComponent(trimmed);
-        CFRelease(trimmed);
+        value = CFURLCopyLastPathComponent(url);
     }
     else if (CFEqual(key, kCFURLLocalizedNameKey))
     {
         // Key for the resource’s localized or extension-hidden name, retuned as a CFString object.
-        CFURLRef trimmed = CFURLCreateCopyDeletingPathExtension(kCFAllocatorDefault, url);
-        value = CFURLCopyLastPathComponent(trimmed); // this should be localized
-        CFRelease(trimmed);
+        // extensions are never hidden here (see kCFURLHasHiddenExtensionKey)
+        value = CFURLCopyLastPathComponent(url); // this should be localized
     }
     else if (CFEqual(key, kCFURLPathKey))
     {
@@ -231,8 +246,8 @@ static CFTypeRef CFURLCreatePropertyForKey(CFURLRef url, CFStringRef key, CFErro
     }
     else if (CFEqual(key, kCFURLIsSymbolicLinkKey))
     {
-        // Key for determining whether the resource is a directory, returned as a CFBoolean object.
-        if (CFURLStat(url, &info))
+        // Key for determining whether the resource is a symbolic link, returned as a CFBoolean object.
+        if (CFURLLstat(url, &info))
         {
             value = S_ISLNK(info.st_mode) ? kCFBooleanTrue : kCFBooleanFalse;
         }
@@ -278,13 +293,14 @@ static CFTypeRef CFURLCreatePropertyForKey(CFURLRef url, CFStringRef key, CFErro
         CFStringRef lastPathComp = CFURLCopyLastPathComponent(url);
         Boolean isHidden = false;
 
-        if (CFStringGetLength(lastPathComp) > 0)
+        if (lastPathComp != NULL && CFStringGetLength(lastPathComp) > 0)
         {
             isHidden = CFStringGetCharacterAtIndex(lastPathComp, 0) == '.';
         }
 
         value = isHidden ? kCFBooleanTrue : kCFBooleanFalse;
-        CFRelease(lastPathComp);
+        if (lastPathComp != NULL)
+            CFRelease(lastPathComp);
     }
     else if (CFEqual(key, kCFURLHasHiddenExtensionKey))
     {
@@ -295,8 +311,8 @@ static CFTypeRef CFURLCreatePropertyForKey(CFURLRef url, CFStringRef key, CFErro
         // Key for the resource’s creation date, returned as a CFDate object if the volume supports creation dates, or nil if creation dates are unsupported.
         if (CFURLStat(url, &info))
         {
-            CFTimeInterval t = (CFTimeInterval)(info.st_ctime * NSEC_PER_SEC + info.st_ctimespec.tv_nsec) / (CFTimeInterval)NSEC_PER_SEC;
-            value = CFDateCreate(kCFAllocatorDefault, t);
+            // fall back to the change time where the file system has no birth time
+            value = dateFromTimespec(info.st_birthtimespec.tv_sec != 0 ? info.st_birthtimespec : info.st_ctimespec);
         }
         else
         {
@@ -307,8 +323,7 @@ static CFTypeRef CFURLCreatePropertyForKey(CFURLRef url, CFStringRef key, CFErro
     {
         if (CFURLStat(url, &info))
         {
-            CFTimeInterval t = (CFTimeInterval)(info.st_atime * NSEC_PER_SEC + info.st_atimespec.tv_nsec) / (CFTimeInterval)NSEC_PER_SEC;
-            value = CFDateCreate(kCFAllocatorDefault, t);
+            value = dateFromTimespec(info.st_atimespec);
         }
         else
         {
@@ -319,8 +334,7 @@ static CFTypeRef CFURLCreatePropertyForKey(CFURLRef url, CFStringRef key, CFErro
     {
         if (CFURLStat(url, &info))
         {
-            CFTimeInterval t = (CFTimeInterval)(info.st_mtime * NSEC_PER_SEC + info.st_mtimespec.tv_nsec) / (CFTimeInterval)NSEC_PER_SEC;
-            value = CFDateCreate(kCFAllocatorDefault, t);
+            value = dateFromTimespec(info.st_mtimespec);
         }
         else
         {
@@ -331,8 +345,8 @@ static CFTypeRef CFURLCreatePropertyForKey(CFURLRef url, CFStringRef key, CFErro
     {
         if (CFURLStat(url, &info))
         {
-            CFTimeInterval t = (CFTimeInterval)(info.st_mtime * NSEC_PER_SEC + info.st_mtimespec.tv_nsec) / (CFTimeInterval)NSEC_PER_SEC;
-            value = CFDateCreate(kCFAllocatorDefault, t);
+            // attributes change the inode, and so the change time
+            value = dateFromTimespec(info.st_ctimespec);
         }
         else
         {
@@ -344,7 +358,8 @@ static CFTypeRef CFURLCreatePropertyForKey(CFURLRef url, CFStringRef key, CFErro
         // Key for the number of hard links to the resource, returned as a CFNumber object.
         if (CFURLStat(url, &info))
         {
-            value = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &info.st_nlink);
+            int linkCount = info.st_nlink; // nlink_t is 16 bits
+            value = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &linkCount);
         }
         else
         {
@@ -397,9 +412,19 @@ static CFTypeRef CFURLCreatePropertyForKey(CFURLRef url, CFStringRef key, CFErro
         }
         
         CFStringRef extension = CFURLCopyPathExtension(url);
-        value = UTTypeCreatePreferredIdentifierForTag(*tagType, extension, NULL); 
+        if (extension != NULL)
+        {
+            value = UTTypeCreatePreferredIdentifierForTag(*tagType, extension, NULL);
+            CFRelease(extension);
+        }
 
-        CFRelease(extension);
+        if (value == NULL)
+        {
+            // no extension, or one LaunchServices doesn't know: folders are public.folder and
+            // everything else is plain data (macOS would make up a dynamic UTI that conforms to it)
+            Boolean isDirectory = CFURLStat(url, &info) && S_ISDIR(info.st_mode);
+            value = CFRetain(isDirectory ? CFSTR("public.folder") : CFSTR("public.data"));
+        }
     }
     else if (CFEqual(key, kCFURLLocalizedTypeDescriptionKey))
     {
@@ -443,7 +468,8 @@ static CFTypeRef CFURLCreatePropertyForKey(CFURLRef url, CFStringRef key, CFErro
         // Key for the optimal block size to use when reading or writing this file's data, returned as a CFNumber object, or NULL if the preferred size is not available.
         if (CFURLStat(url, &info))
         {
-            value = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &info.st_blksize);
+            long blockSize = info.st_blksize; // blksize_t is 32 bits
+            value = CFNumberCreate(kCFAllocatorDefault, kCFNumberLongType, &blockSize);
         }
         else
         {
@@ -497,6 +523,25 @@ static CFTypeRef CFURLCreatePropertyForKey(CFURLRef url, CFStringRef key, CFErro
     else if (CFEqual(key, kCFURLFileResourceTypeKey))
     {
         // Key for the resource’s object type, returned as a CFString object. See “File Resource Types” for possible values.
+        if (CFURLLstat(url, &info))
+        {
+            switch (info.st_mode & S_IFMT)
+            {
+                case S_IFIFO: value = kCFURLFileResourceTypeNamedPipe; break;
+                case S_IFCHR: value = kCFURLFileResourceTypeCharacterSpecial; break;
+                case S_IFDIR: value = kCFURLFileResourceTypeDirectory; break;
+                case S_IFBLK: value = kCFURLFileResourceTypeBlockSpecial; break;
+                case S_IFREG: value = kCFURLFileResourceTypeRegular; break;
+                case S_IFLNK: value = kCFURLFileResourceTypeSymbolicLink; break;
+                case S_IFSOCK: value = kCFURLFileResourceTypeSocket; break;
+                default: value = kCFURLFileResourceTypeUnknown; break;
+            }
+            CFRetain(value);
+        }
+        else
+        {
+            posixError(error);
+        }
     }
     else if (CFEqual(key, kCFURLVolumeAvailableCapacityKey))
     {
